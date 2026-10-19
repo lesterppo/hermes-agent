@@ -8,17 +8,24 @@
  * session, the gateway) survives a plain SIGTERM and keeps files (e.g. the
  * venv shim) locked. So on Windows we tree-kill via `forceKillProcessTree`.
  *
- * On POSIX the backend IS spawned into its own session/process-group
- * (start_new_session=True), so `child.kill('SIGTERM')` would only reach the
- * backend and orphan its MCP grandchildren (the leak in #serve-orphans). We
- * signal the whole group via `process.kill(-pid, ...)` instead, falling back
- * to the direct child if the group send fails.
+ * On POSIX the backend gets its own SESSION (start_new_session=True) but NOT
+ * its own process GROUP: libuv keeps the child in the parent's group, so
+ * pgid == the Electron PID while sid == the child PID. `process.kill(-pid)`
+ * therefore targets a group that does not exist — it throws ESRCH, and the
+ * fallback only signals the direct child, orphaning the backend's MCP
+ * grandchildren (observed: a dead desktop's backend kept holding its port).
+ * We resolve the child's real PGID and only signal it when it is unambiguously
+ * the child's own group; otherwise we signal the child and let its
+ * parent-death/shutdown path reap the grandchildren. Signalling the parent's
+ * group would SIGTERM Electron itself.
  *
  * Extracted into its own dependency-free module (no electron import) so the
  * tree-kill / group-kill branching can be asserted directly with a fake child
  * object and spy kill functions, instead of grepping main.ts source text for
  * the function body.
  */
+
+import { readFileSync } from 'node:fs'
 
 export interface StopBackendChildDeps {
   /** Defaults to the real platform check; injectable for tests. */
@@ -31,6 +38,55 @@ export interface StopBackendChildDeps {
    * live process group. Defaults to process.kill.
    */
   killGroup?: (pgid: number, signal: string) => void
+  /**
+   * Resolves a backend child's real process-group id (POSIX). Real: read the
+   * PGID column of /proc/<pid>/stat. Injectable so tests do not depend on the
+   * host's process table; a null/undefined result disables group signalling.
+   */
+  resolvePgid?: (pid: number) => number | null
+}
+
+/** The PGID that may be signalled for `child`, or null when it is not its own group. */
+function signalableGroup(child: BackendProcessRoot, deps: StopBackendChildDeps): number | null {
+  if (!Number.isInteger(child.pid) || (child.pid as number) <= 0) {
+    return null
+  }
+
+  const pid = child.pid as number
+  let pgid: number | null = null
+
+  try {
+    pgid = (deps.resolvePgid ?? readProcessGroupId)(pid)
+  } catch {
+    pgid = null
+  }
+
+  // Only the child's OWN group is safe: pgid 0 is the kernel's "caller's group"
+  // wildcard and any other value belongs to Electron or a sibling — signalling
+  // it would kill the desktop itself. A null/unknown PGID falls back to the
+  // direct child.
+  return pgid === pid ? pgid : null
+}
+
+/**
+ * Read the PGID column (field 5) of /proc/<pid>/stat.
+ *
+ * The comm field (2) is parenthesised and may itself contain spaces and
+ * parentheses ("python (backend)"), so the columns are counted from the LAST
+ * ')' rather than by splitting the whole line.
+ */
+export function readProcessGroupId(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+
+    // fields[0] is state (column 3), so pgrp (column 5) is fields[2].
+    const pgrp = Number.parseInt(fields[2] ?? '', 10)
+
+    return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null
+  } catch {
+    return null
+  }
 }
 
 export interface BackendProcessRoot {
@@ -88,15 +144,20 @@ export async function waitForBackendExit(
   try {
     if ((deps.isWindows ?? process.platform === 'win32') && Number.isInteger(child.pid)) {
       deps.forceKillProcessTree(child.pid as number)
-    } else if (Number.isInteger(child.pid)) {
-      try {
+    } else {
+      const group = signalableGroup(child, deps)
+
+      if (group !== null) {
         const killGroup = deps.killGroup ?? ((pid: number, signal: string): boolean => process.kill(pid, signal))
-        killGroup(-(child.pid as number), 'SIGKILL')
-      } catch {
+
+        try {
+          killGroup(-group, 'SIGKILL')
+        } catch {
+          child.kill('SIGKILL')
+        }
+      } else {
         child.kill('SIGKILL')
       }
-    } else {
-      child.kill('SIGKILL')
     }
   } catch {
     // A failed signal may mean the child is gone, but only exit proves it.
@@ -128,16 +189,22 @@ export function stopBackendChild(child: KillableChild | null | undefined, deps: 
   try {
     if (isWindows && Number.isInteger(child.pid)) {
       deps.forceKillProcessTree(child.pid as number)
-    } else if (Number.isInteger(child.pid)) {
-      // POSIX: pgid == pid (start_new_session). Signal the whole group so MCP
-      // grandchildren die too; fall back to the direct child on failure.
-      try {
-        killGroup(-(child.pid as number), 'SIGTERM')
-      } catch {
+    } else {
+      const group = signalableGroup(child, deps)
+
+      if (group !== null) {
+        // POSIX: signal the child's OWN group so MCP grandchildren die too.
+        try {
+          killGroup(-group, 'SIGTERM')
+        } catch {
+          child.kill('SIGTERM')
+        }
+      } else {
+        // Not a group leader (the usual Electron case: pgid == Electron PID).
+        // Signal the child; its parent-death watchdog and shutdown path reap
+        // the grandchildren. Never signal the parent's group — that is Electron.
         child.kill('SIGTERM')
       }
-    } else {
-      child.kill('SIGTERM')
     }
   } catch {
     // Already gone.
